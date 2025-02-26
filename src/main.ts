@@ -1,14 +1,13 @@
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
-import * as cors from 'cors';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
 
-  // Bật CORS
   app.enableCors({
-    origin: ['http://localhost:3000', 'https://you-tube-frontend-theta.vercel.app/'], // Cho phép frontend truy cập API
+    origin: '*', // Cho phép tất cả các origin (có thể thay đổi nếu cần)
     methods: 'GET,HEAD,PUT,PATCH,POST,DELETE',
+    allowedHeaders: 'Content-Type, Authorization',
     credentials: true,
   });
 
