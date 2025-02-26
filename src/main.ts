@@ -7,7 +7,7 @@ async function bootstrap() {
 
   // Bật CORS
   app.enableCors({
-    origin: 'http://localhost:3000', // Cho phép frontend truy cập API
+    origin: ['http://localhost:3000', 'https://you-tube-frontend-theta.vercel.app/'], // Cho phép frontend truy cập API
     methods: 'GET,HEAD,PUT,PATCH,POST,DELETE',
     credentials: true,
   });
