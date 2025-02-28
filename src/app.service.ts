@@ -1,249 +1,316 @@
-import { Injectable } from '@nestjs/common';
-import axios from 'axios';
+import { Injectable, Logger } from '@nestjs/common';
 import { YoutubeTranscript } from 'youtube-transcript';
-import * as dotenv from 'dotenv';
-import { ConfigService } from '@nestjs/config';
 
-dotenv.config();
+interface Caption {
+  start: number;
+  duration: number;
+  english: string;
+  vietnamese: string;
+  japanese: string;
+  german: string;
+}
+
+interface TranscriptResult {
+  videoId?: string;
+  captions?: Caption[];
+  error?: string;
+  details?: string;
+}
 
 @Injectable()
 export class AppService {
-  constructor(private configService: ConfigService) {}
+  private readonly logger = new Logger(AppService.name);
 
-  // Get API key immediately when service initializes to ensure it's available
-  private readonly API_KEY = this.configService.get<string>('YOUTUBE_API_KEY');
-  
-  async getCaptions(videoId: string) {
+  /**
+   * Lấy phụ đề cho một video YouTube dựa trên ID video
+   * @param videoId ID của video YouTube
+   * @returns Object chứa phụ đề đã đồng bộ hoặc thông báo lỗi
+   */
+  async getCaptions(videoId: string): Promise<TranscriptResult> {
     try {
-      // First try the YoutubeTranscript approach (more reliable)
-      try {
-        return await this.getTranscriptInternal(videoId);
-      } catch (transcriptError) {
-        // Fall back to YouTube API if YoutubeTranscript fails
-        // Lấy danh sách phụ đề có sẵn
-        const captionsList = await this.fetchCaptionsList(videoId);
-        if (!captionsList || captionsList.length === 0) {
-          return { error: 'Không tìm thấy phụ đề cho video này' };
-        }
-
-        // Lọc phụ đề tiếng Anh và tiếng Việt từ danh sách
-        const englishCaption = captionsList.find((cap) => cap.language === 'en');
-        const vietnameseCaption = captionsList.find(
-          (cap) => cap.language === 'vi',
-        );
-
-        if (!englishCaption) {
-          return { error: 'Không tìm thấy phụ đề tiếng Anh' };
-        }
-
-        // Lấy nội dung phụ đề
-        const transcriptEnglish = await this.fetchCaptionContent(
-          englishCaption.id,
-        );
-        const transcriptVietnamese = vietnameseCaption
-          ? await this.fetchCaptionContent(vietnameseCaption.id)
-          : [];
-
-        // Đồng bộ phụ đề
-        const captions = this.syncCaptions(
-          transcriptEnglish,
-          transcriptVietnamese,
-        );
-
-        return { videoId, captions };
-      }
+      return await this.getTranscript(videoId);
     } catch (error) {
-      console.error('Error in getCaptions:', error);
+      this.logger.error(`Error in getCaptions: ${error.message}`, error.stack);
       return { 
         error: 'Lỗi khi lấy phụ đề', 
-        details: error.message,
-        suggestion: 'Hãy kiểm tra API_KEY trong file .env có đúng không và đã được bật cho YouTube Data API v3'
+        details: error.message
       };
     }
   }
 
-  // 📌 Lấy danh sách phụ đề của video
-  private async fetchCaptionsList(videoId: string) {
-    if (!this.API_KEY) {
-      throw new Error('API_KEY is missing in environment variables');
-    }
-    
-    const url = `https://www.googleapis.com/youtube/v3/captions?part=snippet&videoId=${videoId}&key=${this.API_KEY}`;
-    console.log('Fetching captions list from URL:', url);
-    
+  /**
+   * Lấy phụ đề cho một video YouTube dựa trên URL hoặc ID
+   * @param videoInput URL hoặc ID của video YouTube
+   * @returns Object chứa phụ đề đã đồng bộ hoặc thông báo lỗi
+   */
+  async getTranscript(videoInput: string): Promise<TranscriptResult> {
     try {
-      const response = await axios.get(url);
-      return response.data.items.map((item) => ({
-        id: item.id,
-        language: item.snippet.language,
-      }));
+      // Xác định đầu vào là URL hay ID
+      const videoId = this.isUrl(videoInput) ? this.extractVideoId(videoInput) : videoInput;
+      
+      if (!videoId) {
+        return { error: 'URL hoặc ID YouTube không hợp lệ' };
+      }
+
+      // Lấy phụ đề tiếng Anh (ngôn ngữ chính)
+      const transcriptEnglish = await this.fetchTranscriptSafely(videoId, 'en');
+      
+      if (!transcriptEnglish || transcriptEnglish.length === 0) {
+        return { error: 'Không tìm thấy phụ đề tiếng Anh cho video này' };
+      }
+      
+      // Khởi tạo phụ đề các ngôn ngữ khác
+      const transcriptVietnamese = await this.fetchTranscriptSafely(videoId, 'vi');
+      const transcriptJapanese = await this.fetchTranscriptSafely(videoId, 'ja');
+      const transcriptGerman = await this.fetchTranscriptSafely(videoId, 'de');
+
+      // Đồng bộ phụ đề các ngôn ngữ với phụ đề tiếng Anh
+      const syncedCaptions = this.syncMultiLanguageCaptions(
+        transcriptEnglish, 
+        transcriptVietnamese, 
+        transcriptJapanese, 
+        transcriptGerman
+      );
+      
+      // Gộp các phụ đề liên tiếp thành các đoạn lớn hơn
+      const combinedCaptions = this.combineCaptions(syncedCaptions);
+
+      return { videoId, captions: combinedCaptions };
     } catch (error) {
-      console.error('Failed to fetch captions list:', error.response?.data || error.message);
-      throw error;
+      this.logger.error(`Failed to fetch transcript: ${error.message}`, error.stack);
+      return { 
+        error: 'Không lấy được phụ đề', 
+        details: error.message 
+      };
     }
   }
 
-  // 📌 Lấy nội dung phụ đề dựa trên ID
-  private async fetchCaptionContent(captionId: string) {
-    if (!this.API_KEY) {
-      throw new Error('API_KEY is missing in environment variables');
+  /**
+   * Lấy phụ đề cho một ngôn ngữ cụ thể, xử lý lỗi an toàn
+   * @param videoId ID của video YouTube
+   * @param langCode Mã ngôn ngữ (en, vi, ja, de)
+   * @returns Mảng phụ đề hoặc mảng rỗng nếu có lỗi
+   */
+  private async fetchTranscriptSafely(videoId: string, langCode: string): Promise<any[]> {
+    try {
+      const transcript = await YoutubeTranscript.fetchTranscript(videoId, { lang: langCode });
+      this.logger.log(`Đã lấy được phụ đề ${langCode} cho video ${videoId}`);
+      return transcript;
+    } catch (error) {
+      this.logger.warn(`Không lấy được phụ đề ${langCode} cho video ${videoId}: ${error.message}`);
+      return [];
     }
-    
-    const url = `https://www.googleapis.com/youtube/v3/captions/${captionId}?tfmt=srt&key=${this.API_KEY}`;
-    const response = await axios.get(url);
-    return this.parseSRT(response.data);
   }
 
-  // 📌 Chuyển SRT thành mảng JSON
-  private parseSRT(srtData: string) {
-    return srtData
-      .split('\n\n')
-      .map((block) => {
-        const lines = block.split('\n');
-        if (lines.length < 2) return null;
-
-        const timeMatch = lines[1].match(
-          /(\d+):(\d+):(\d+),(\d+) --> (\d+):(\d+):(\d+),(\d+)/,
-        );
-        if (!timeMatch) return null;
-
-        // Extract start time with milliseconds
-        const startSeconds = this.formatTimesWithMilliseconds(
-          timeMatch[1], timeMatch[2], timeMatch[3], timeMatch[4]
-        );
-        // Extract end time with milliseconds
-        const endSeconds = this.formatTimesWithMilliseconds(
-          timeMatch[5], timeMatch[6], timeMatch[7], timeMatch[8]
-        );
-        // Calculate actual duration
-        const duration = endSeconds - startSeconds;
-
-        return {
-          start: startSeconds * 1000, // Chuyển đổi giây thành mili giây
-          duration: duration * 1000, // Chuyển đổi giây thành mili giây
-          text: lines.slice(2).join(' '),
-        };
-      })
-      .filter(Boolean);
-  }
-
-  // 📌 Chuyển đổi thời gian hh:mm:ss,ms thành giây với độ chính xác millisecond
-  private formatTimesWithMilliseconds(h: string, m: string, s: string, ms: string) {
-    return parseInt(h) * 3600 + parseInt(m) * 60 + parseInt(s) + parseInt(ms) / 1000;
-  }
-
-  // 📌 Đồng bộ phụ đề tiếng Anh & tiếng Việt
-  private syncCaptions(transcriptEnglish, transcriptVietnamese) {
-    const findClosestMatch = (targetTime, transcripts) => {
+  /**
+   * Đồng bộ phụ đề đa ngôn ngữ với phụ đề tiếng Anh
+   * @param transcriptEnglish Mảng phụ đề tiếng Anh
+   * @param transcriptVietnamese Mảng phụ đề tiếng Việt
+   * @param transcriptJapanese Mảng phụ đề tiếng Nhật
+   * @param transcriptGerman Mảng phụ đề tiếng Đức
+   * @returns Mảng phụ đề đã đồng bộ với nhiều ngôn ngữ
+   */
+  private syncMultiLanguageCaptions(
+    transcriptEnglish: any[], 
+    transcriptVietnamese: any[] = [], 
+    transcriptJapanese: any[] = [], 
+    transcriptGerman: any[] = []
+  ): Caption[] {
+    // Hàm tìm phụ đề có thời gian gần nhất với mốc thời gian đích
+    const findClosestMatch = (targetTime: number, transcripts: any[]): any | null => {
+      if (!transcripts || transcripts.length === 0) return null;
+      
       return transcripts.reduce((closest, item) => {
-        return Math.abs(item.start - targetTime) <
-          Math.abs(closest.start - targetTime)
+        return Math.abs(item.offset - targetTime) < Math.abs(closest.offset - targetTime)
           ? item
           : closest;
       }, transcripts[0]);
     };
 
+    // Đồng bộ phụ đề các ngôn ngữ với phụ đề tiếng Anh
     return transcriptEnglish.map((item) => {
-      const vietnameseMatch =
-        transcriptVietnamese.length > 0
-          ? findClosestMatch(item.start, transcriptVietnamese)
-          : { text: '' };
+      const vietnameseMatch = transcriptVietnamese.length > 0 
+        ? findClosestMatch(item.offset, transcriptVietnamese)
+        : null;
+        
+      const japaneseMatch = transcriptJapanese.length > 0 
+        ? findClosestMatch(item.offset, transcriptJapanese)
+        : null;
+        
+      const germanMatch = transcriptGerman.length > 0 
+        ? findClosestMatch(item.offset, transcriptGerman)
+        : null;
 
       return {
-        start: item.start,
+        start: item.offset,
         duration: item.duration,
-        english: item.text,
-        vietnamese: vietnameseMatch.text || '',
+        english: this.formatText(item.text),
+        vietnamese: this.formatText(vietnameseMatch?.text || ''),
+        japanese: this.formatText(japaneseMatch?.text || ''),
+        german: this.formatText(germanMatch?.text || '')
       };
     });
   }
-
-  //-------------------
-  // Phương thức cải tiến, sử dụng thư viện YoutubeTranscript trước (không yêu cầu API key)
-  private async getTranscriptInternal(videoId: string) {
-    try {
-      const transcriptEnglish = await YoutubeTranscript.fetchTranscript(
-        videoId,
-        { lang: 'en' },
-      );
+  
+  /**
+   * Gộp các phụ đề liên tiếp thành một đoạn với duration tổng hợp
+   * @param captions Mảng phụ đề đã đồng bộ
+   * @returns Mảng phụ đề đã được gộp
+   */
+  private combineCaptions(captions: Caption[]): Caption[] {
+    if (!captions || captions.length === 0) return [];
+    
+    // Khởi tạo với phụ đề đầu tiên
+    const combined: Caption[] = [{
+      start: captions[0].start,
+      duration: captions[0].duration,
+      english: captions[0].english,
+      vietnamese: captions[0].vietnamese,
+      japanese: captions[0].japanese,
+      german: captions[0].german
+    }];
+    
+    // Duyệt qua các phụ đề từ vị trí thứ 2 trở đi
+    for (let i = 1; i < captions.length; i++) {
+      const current = captions[i];
+      const last = combined[combined.length - 1];
       
-      let transcriptVietnamese = [];
-      try {
-        transcriptVietnamese = await YoutubeTranscript.fetchTranscript(
-          videoId,
-          { lang: 'vi' },
-        );
-      } catch (error) {
-        console.log('Vietnamese transcript not available:', error.message);
-        // Continue without Vietnamese transcript
-      }
-
-      // Hàm tìm câu tiếng Việt có thời gian gần nhất với câu tiếng Anh
-      const findClosestMatch = (targetTime, transcripts) => {
-        if (!transcripts || transcripts.length === 0) return null;
+      // Tính khoảng cách thời gian giữa thời điểm kết thúc phụ đề trước và thời điểm bắt đầu phụ đề hiện tại
+      const timeGap = current.start - (last.start + last.duration);
+      
+      // Kiểm tra nếu nội dung có vẻ là một câu hoàn chỉnh
+      const lastEndsWithPunctuation = /[.!?]$/.test(last.english.trim());
+      const currentIsSentenceStart = /^[A-Z]/.test(current.english.trim()) || /^["\']/.test(current.english.trim());
+      const seemsNewSentence = lastEndsWithPunctuation && currentIsSentenceStart;
+      
+      // Các điều kiện để tạo một phụ đề mới:
+      // 1. Khoảng cách thời gian > 0.8 giây
+      // 2. Phụ đề hiện tại có duration > 15 giây
+      // 3. Có dấu hiệu là câu mới bắt đầu
+      // 4. Tổng độ dài văn bản > 150 ký tự (quá dài để đọc trong một khung hình)
+      if (
+        timeGap > 0.8 || 
+        last.duration > 15 || 
+        seemsNewSentence ||
+        (last.english.length + current.english.length > 150)
+      ) {
+        combined.push({
+          start: current.start,
+          duration: current.duration,
+          english: current.english,
+          vietnamese: current.vietnamese,
+          japanese: current.japanese,
+          german: current.german
+        });
+      } else {
+        // Kết hợp phụ đề hiện tại vào phụ đề trước đó
+        last.duration = (current.start + current.duration) - last.start;
         
-        return transcripts.reduce((closest, item) => {
-          return Math.abs(item.offset - targetTime) <
-            Math.abs(closest.offset - targetTime)
-            ? item
-            : closest;
-        }, transcripts[0]);
-      };
-
-      // Đồng bộ transcript tiếng Anh với câu tiếng Việt gần nhất
-      const captions = transcriptEnglish.map((item) => {
-        const vietnameseMatch = transcriptVietnamese.length > 0 
-          ? findClosestMatch(item.offset, transcriptVietnamese)
-          : null;
-
-        return {
-          start: item.offset, // Giữ nguyên giá trị miligiây
-          duration: item.duration, // Giữ nguyên giá trị miligiây
-          english: this.formatText(item.text),
-          vietnamese: this.formatText(vietnameseMatch?.text || ''),
-        };
-      });
-
-      return { videoId, captions };
-    } catch (error) {
-      throw error; // Rethrow to fallback to the API method
-    }
-  }
-
-  async getTranscript(videoUrl: string) {
-    try {
-      const videoId = this.extractVideoId(videoUrl);
-      if (!videoId) {
-        return { error: 'Invalid YouTube URL' };
+        // Kết hợp văn bản các ngôn ngữ
+        this.combineText(last, current, 'english');
+        this.combineText(last, current, 'vietnamese');
+        this.combineText(last, current, 'japanese');
+        this.combineText(last, current, 'german');
       }
-
-      return this.getTranscriptInternal(videoId);
-    } catch (error) {
-      return { error: 'Failed to fetch transcript', details: error.message };
     }
+    
+    // Làm sạch văn bản cuối cùng
+    combined.forEach(caption => {
+      caption.english = this.cleanText(caption.english);
+      caption.vietnamese = this.cleanText(caption.vietnamese);
+      caption.japanese = this.cleanText(caption.japanese);
+      caption.german = this.cleanText(caption.german);
+    });
+    
+    return combined;
   }
 
-  // This method is no longer used in getTranscriptInternal
-  formatTime(seconds: number): number {
-    return Math.floor(seconds);
+  /**
+   * Kết hợp văn bản từ phụ đề mới vào phụ đề cũ
+   * @param target Phụ đề đích
+   * @param source Phụ đề nguồn
+   * @param language Ngôn ngữ cần kết hợp
+   */
+  private combineText(target: any, source: any, language: string): void {
+    if (!source[language]) return;
+    
+    const needSpace = target[language] && !target[language].endsWith(' ') && !source[language].startsWith(' ');
+    target[language] += source[language] ? (needSpace ? ' ' : '') + source[language] : '';
   }
 
-  formatText(text: string): string {
+  /**
+   * Định dạng lại văn bản phụ đề
+   * @param text Văn bản cần định dạng
+   * @returns Văn bản đã định dạng
+   */
+  private formatText(text: string): string {
+    if (!text) return '';
     return text.replace(/\n/g, ' ').replace(/&amp;#39;/g, "'");
   }
+  
+  /**
+   * Làm sạch văn bản, loại bỏ khoảng trắng thừa và sửa một số lỗi thường gặp
+   * @param text Văn bản cần làm sạch
+   * @returns Văn bản đã được làm sạch
+   */
+  private cleanText(text: string): string {
+    if (!text) return '';
+    
+    return text
+      // Loại bỏ khoảng trắng thừa ở đầu và cuối
+      .trim()
+      // Loại bỏ nhiều khoảng trắng liên tiếp
+      .replace(/\s+/g, ' ')
+      // Sửa lỗi "d the" thành "the"
+      .replace(/\bd\s+the\b/gi, ' the')
+      // Đảm bảo khoảng trắng sau dấu câu
+      .replace(/([.!?])([A-Z])/g, '$1 $2')
+      // Sửa một số lỗi khác thường gặp trong phụ đề YouTube
+      .replace(/&amp;/g, '&')
+      .replace(/&#39;/g, "'")
+      .replace(/&quot;/g, '"')
+      .replace(/&gt;/g, '>')
+      .replace(/&lt;/g, '<')
+      // Chuẩn hóa ký tự âm nhạc
+      .replace(/\[Music\]/gi, '[Music]')
+      .replace(/\[Nhạc\]/gi, '[Nhạc]');
+  }
 
+  /**
+   * Kiểm tra xem một chuỗi có phải là URL hay không
+   * @param str Chuỗi cần kiểm tra
+   * @returns true nếu là URL, ngược lại false
+   */
+  private isUrl(str: string): boolean {
+    return str.includes('youtube.com') || str.includes('youtu.be');
+  }
+
+  /**
+   * Trích xuất ID video từ URL YouTube
+   * @param url URL YouTube
+   * @returns ID video hoặc null nếu URL không hợp lệ
+   */
   private extractVideoId(url: string): string | null {
-    const match = url.match(
-      /(?:https?:\/\/)?(?:www\.)?youtube\.com\/watch\?v=([^&]+)/,
+    // Xử lý URL youtube.com/watch?v=
+    const watchMatch = url.match(
+      /(?:https?:\/\/)?(?:www\.)?youtube\.com\/watch\?v=([^&]+)/
     );
+    if (watchMatch) return watchMatch[1];
     
-    if (match) return match[1];
-    
-    // Also support youtu.be URLs
+    // Xử lý URL dạng rút gọn youtu.be/
     const shortMatch = url.match(
       /(?:https?:\/\/)?(?:www\.)?youtu\.be\/([^?&]+)/
     );
     
-    return shortMatch ? shortMatch[1] : null;
+    // Xử lý URL nhúng youtube.com/embed/
+    const embedMatch = url.match(
+      /(?:https?:\/\/)?(?:www\.)?youtube\.com\/embed\/([^?&]+)/
+    );
+    
+    if (watchMatch) return watchMatch[1];
+    if (shortMatch) return shortMatch[1];
+    if (embedMatch) return embedMatch[1];
+    
+    return null;
   }
 }
